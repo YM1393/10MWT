@@ -9,12 +9,29 @@ import threading
 from datetime import datetime
 import csv
 import json
+import io
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib
 matplotlib.use('TkAgg')
 matplotlib.rcParams['font.family'] = 'Malgun Gothic'
 matplotlib.rcParams['axes.unicode_minus'] = False
+
+# PDF 생성
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+# 한글 폰트 등록
+try:
+    pdfmetrics.registerFont(TTFont('MalgunGothic', 'C:/Windows/Fonts/malgun.ttf'))
+    pdfmetrics.registerFont(TTFont('MalgunGothicBold', 'C:/Windows/Fonts/malgunbd.ttf'))
+except:
+    pass
 
 # Supabase 연결
 from supabase import create_client
@@ -70,6 +87,9 @@ class App:
 
         # 측정별 발목 데이터 저장 {item_id: {'time': [], 'left_y': [], 'right_y': [], 'distance': []}}
         self.ankle_data_per_measurement = {}
+
+        # Supabase 측정 ID 매핑 {tree_item_id: measurement_id}
+        self.measurement_id_map = {}
 
         # 인라인 그래프
         self.inline_fig = None
@@ -536,6 +556,17 @@ class App:
                                    width=8)
         self.btn_delete.pack(side='left', padx=3)
 
+        # PDF 리포트 버튼
+        self.btn_pdf = tk.Button(btn_list_frame, text="PDF 리포트",
+                                command=self.generate_pdf_report,
+                                font=('맑은 고딕', 9),
+                                bg='#e67e22', fg='white',
+                                activebackground='#d35400',
+                                relief='flat',
+                                cursor='hand2',
+                                width=8)
+        self.btn_pdf.pack(side='left', padx=3)
+
         # 전체 그래프 버튼
         self.btn_graph = tk.Button(btn_list_frame, text="전체 그래프",
                                   command=self.show_graph,
@@ -570,14 +601,35 @@ class App:
 
     def delete_selected(self):
         selected = self.tree.selection()
-        if selected:
+        if not selected:
+            return
+
+        # 검색된 환자의 기록인 경우 Supabase에서도 삭제
+        if self.searched_patient_id:
+            if not messagebox.askyesno("확인", f"선택한 {len(selected)}개의 기록을 클라우드에서 삭제하시겠습니까?"):
+                return
+
+            try:
+                for item in selected:
+                    measurement_id = self.measurement_id_map.get(item)
+                    if measurement_id:
+                        supabase.table('measurements').delete().eq('id', measurement_id).execute()
+                        del self.measurement_id_map[item]
+                    if item in self.ankle_data_per_measurement:
+                        del self.ankle_data_per_measurement[item]
+                    self.tree.delete(item)
+                messagebox.showinfo("완료", "선택한 기록이 삭제되었습니다.")
+            except Exception as e:
+                messagebox.showerror("오류", f"삭제 실패: {e}")
+        else:
+            # 로컬 기록만 삭제
             for item in selected:
-                # 발목 데이터도 삭제
                 if item in self.ankle_data_per_measurement:
                     del self.ankle_data_per_measurement[item]
                 self.tree.delete(item)
-            # 삭제 후 그래프 초기화
-            self.init_inline_graph()
+
+        # 삭제 후 그래프 초기화
+        self.init_inline_graph()
 
     def init_inline_graph(self):
         """인라인 그래프 영역 초기화"""
@@ -2021,6 +2073,9 @@ class App:
             for item in self.tree.get_children():
                 self.tree.delete(item)
 
+            # 측정 ID 매핑 초기화
+            self.measurement_id_map = {}
+
             # 측정 기록 표시
             for m in measurements:
                 item_id = self.tree.insert('', 'end', values=(
@@ -2031,6 +2086,9 @@ class App:
                     f"{m.get('speed_ms', 0):.2f}",
                     m.get('grade', '')
                 ))
+                # 측정 ID 매핑 저장
+                self.measurement_id_map[item_id] = m['id']
+
                 # 발목 데이터 저장 (그래프용)
                 if m.get('ankle_data'):
                     try:
@@ -2089,8 +2147,11 @@ class App:
         # 히스토리 팝업 창
         history_win = tk.Toplevel(self.root)
         history_win.title(f"측정 히스토리 - {self.entry_name.get()}")
-        history_win.geometry("800x500")
+        history_win.geometry("800x550")
         history_win.configure(bg='#1a1a2e')
+
+        # 측정 ID 매핑 저장
+        measurement_ids = {}
 
         # 상단: 기록 테이블
         table_frame = tk.Frame(history_win, bg='#16213e')
@@ -2110,14 +2171,143 @@ class App:
 
         for m in measurements:
             date_str = m['measured_at'][:10] if m.get('measured_at') else '-'
-            tree.insert('', 'end', values=(
+            item_id = tree.insert('', 'end', values=(
                 date_str,
                 f"{m.get('time_seconds', 0):.2f}",
                 f"{m.get('speed_ms', 0):.2f}",
                 m.get('grade', '-')
             ))
+            measurement_ids[item_id] = m['id']  # 측정 ID 저장
 
         tree.pack(fill='x', padx=5, pady=5)
+
+        # 삭제 버튼 프레임
+        btn_frame = tk.Frame(history_win, bg='#1a1a2e')
+        btn_frame.pack(pady=5)
+
+        def delete_selected_measurement():
+            """선택된 측정 기록 삭제"""
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning("경고", "삭제할 기록을 선택하세요.")
+                return
+
+            if not messagebox.askyesno("확인", f"선택한 {len(selected)}개의 기록을 삭제하시겠습니까?"):
+                return
+
+            try:
+                for item in selected:
+                    measurement_id = measurement_ids.get(item)
+                    if measurement_id:
+                        supabase.table('measurements').delete().eq('id', measurement_id).execute()
+                    tree.delete(item)
+                messagebox.showinfo("완료", "선택한 기록이 삭제되었습니다.")
+            except Exception as e:
+                messagebox.showerror("오류", f"삭제 실패: {e}")
+
+        def edit_measurement_date():
+            """선택된 측정 기록의 날짜 수정"""
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning("경고", "수정할 기록을 선택하세요.")
+                return
+
+            if len(selected) > 1:
+                messagebox.showwarning("경고", "하나의 기록만 선택하세요.")
+                return
+
+            item = selected[0]
+            measurement_id = measurement_ids.get(item)
+            current_date = tree.item(item)['values'][0]
+
+            # 날짜 수정 다이얼로그
+            edit_dialog = tk.Toplevel(history_win)
+            edit_dialog.title("측정일 수정")
+            edit_dialog.geometry("300x150")
+            edit_dialog.configure(bg='#1a1a2e')
+            edit_dialog.transient(history_win)
+            edit_dialog.grab_set()
+
+            tk.Label(edit_dialog, text="측정일 수정",
+                    font=('맑은 고딕', 12, 'bold'),
+                    bg='#1a1a2e', fg='white').pack(pady=(20, 10))
+
+            # 날짜 입력
+            date_frame = tk.Frame(edit_dialog, bg='#1a1a2e')
+            date_frame.pack(pady=10)
+
+            tk.Label(date_frame, text="날짜 (YYYY-MM-DD):",
+                    bg='#1a1a2e', fg='#bdc3c7',
+                    font=('맑은 고딕', 10)).pack(side='left', padx=5)
+
+            date_entry = tk.Entry(date_frame, font=('맑은 고딕', 11),
+                                 bg='#2d3a4f', fg='white',
+                                 insertbackground='white',
+                                 relief='flat', width=12)
+            date_entry.pack(side='left', padx=5, ipady=3)
+            date_entry.insert(0, current_date)
+
+            def save_date():
+                new_date = date_entry.get().strip()
+                # 날짜 형식 검증
+                try:
+                    datetime.strptime(new_date, '%Y-%m-%d')
+                except ValueError:
+                    messagebox.showerror("오류", "날짜 형식이 올바르지 않습니다.\nYYYY-MM-DD 형식으로 입력하세요.")
+                    return
+
+                try:
+                    # Supabase 업데이트
+                    supabase.table('measurements').update({
+                        'measured_at': f"{new_date}T00:00:00+00:00"
+                    }).eq('id', measurement_id).execute()
+
+                    # Treeview 업데이트
+                    values = list(tree.item(item)['values'])
+                    values[0] = new_date
+                    tree.item(item, values=values)
+
+                    edit_dialog.destroy()
+                    messagebox.showinfo("완료", "측정일이 수정되었습니다.")
+                except Exception as e:
+                    messagebox.showerror("오류", f"수정 실패: {e}")
+
+            # 버튼
+            btn_frame2 = tk.Frame(edit_dialog, bg='#1a1a2e')
+            btn_frame2.pack(pady=15)
+
+            tk.Button(btn_frame2, text="저장",
+                     command=save_date,
+                     font=('맑은 고딕', 10),
+                     bg='#27ae60', fg='white',
+                     relief='flat', width=8).pack(side='left', padx=5)
+
+            tk.Button(btn_frame2, text="취소",
+                     command=edit_dialog.destroy,
+                     font=('맑은 고딕', 10),
+                     bg='#7f8c8d', fg='white',
+                     relief='flat', width=8).pack(side='left', padx=5)
+
+        tk.Button(btn_frame, text="날짜 수정",
+                 command=edit_measurement_date,
+                 font=('맑은 고딕', 9),
+                 bg='#3498db', fg='white',
+                 relief='flat', cursor='hand2',
+                 width=8).pack(side='left', padx=5)
+
+        tk.Button(btn_frame, text="선택 삭제",
+                 command=delete_selected_measurement,
+                 font=('맑은 고딕', 9),
+                 bg='#e74c3c', fg='white',
+                 relief='flat', cursor='hand2',
+                 width=8).pack(side='left', padx=5)
+
+        tk.Button(btn_frame, text="닫기",
+                 command=history_win.destroy,
+                 font=('맑은 고딕', 9),
+                 bg='#7f8c8d', fg='white',
+                 relief='flat', cursor='hand2',
+                 width=6).pack(side='left', padx=5)
 
         # 하단: 트렌드 그래프
         graph_frame = tk.Frame(history_win, bg='#1a1a2e')
@@ -2158,6 +2348,282 @@ class App:
         canvas = FigureCanvasTkAgg(fig, master=graph_frame)
         canvas.draw()
         canvas.get_tk_widget().pack(fill='both', expand=True)
+
+    # ===== PDF 리포트 생성 =====
+
+    def generate_pdf_report(self):
+        """PDF 리포트 생성"""
+        # 검색된 환자가 있으면 해당 환자, 없으면 선택된 환자
+        if self.searched_patient_id:
+            patient_id = self.searched_patient_id
+            patient_name = self.searched_patient_name
+        elif self.selected_patient_id:
+            patient_id = self.selected_patient_id
+            patient_name = self.entry_name.get()
+        else:
+            messagebox.showwarning("경고", "환자를 먼저 선택하거나 검색하세요.")
+            return
+
+        # 환자 정보 조회
+        try:
+            patient_response = supabase.table('patients').select('*').eq('id', patient_id).execute()
+            if not patient_response.data:
+                messagebox.showerror("오류", "환자 정보를 찾을 수 없습니다.")
+                return
+            patient = patient_response.data[0]
+
+            # 측정 기록 조회
+            measurements_response = supabase.table('measurements').select('*').eq(
+                'patient_id', patient_id
+            ).order('measured_at', desc=True).execute()
+            measurements = measurements_response.data
+
+            if not measurements:
+                messagebox.showwarning("경고", "이 환자의 측정 기록이 없습니다.")
+                return
+
+        except Exception as e:
+            messagebox.showerror("오류", f"데이터 조회 실패: {e}")
+            return
+
+        # 파일 저장 경로 선택
+        file_path = filedialog.asksaveasfilename(
+            title="PDF 리포트 저장",
+            defaultextension=".pdf",
+            filetypes=[("PDF 파일", "*.pdf")],
+            initialfile=f"10MWT_리포트_{patient_name}_{datetime.now().strftime('%Y%m%d')}.pdf"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            self.create_pdf_report(file_path, patient, measurements)
+            messagebox.showinfo("완료", f"PDF 리포트가 저장되었습니다.\n{file_path}")
+        except Exception as e:
+            messagebox.showerror("오류", f"PDF 생성 실패: {e}")
+
+    def create_pdf_report(self, file_path, patient, measurements):
+        """PDF 문서 생성"""
+        doc = SimpleDocTemplate(file_path, pagesize=A4,
+                               rightMargin=20*mm, leftMargin=20*mm,
+                               topMargin=20*mm, bottomMargin=20*mm)
+
+        # 스타일 설정
+        styles = getSampleStyleSheet()
+        try:
+            title_style = ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Heading1'],
+                fontName='MalgunGothicBold',
+                fontSize=24,
+                spaceAfter=30,
+                alignment=1  # 중앙 정렬
+            )
+            heading_style = ParagraphStyle(
+                'CustomHeading',
+                parent=styles['Heading2'],
+                fontName='MalgunGothicBold',
+                fontSize=14,
+                spaceBefore=20,
+                spaceAfter=10,
+                textColor=colors.HexColor('#2c3e50')
+            )
+            normal_style = ParagraphStyle(
+                'CustomNormal',
+                parent=styles['Normal'],
+                fontName='MalgunGothic',
+                fontSize=11,
+                spaceAfter=6
+            )
+        except:
+            title_style = styles['Heading1']
+            heading_style = styles['Heading2']
+            normal_style = styles['Normal']
+
+        elements = []
+
+        # 제목
+        elements.append(Paragraph("10m 보행 테스트 리포트", title_style))
+        elements.append(Spacer(1, 10))
+
+        # 생성 날짜
+        elements.append(Paragraph(f"생성일: {datetime.now().strftime('%Y년 %m월 %d일 %H:%M')}", normal_style))
+        elements.append(Spacer(1, 20))
+
+        # 환자 정보
+        elements.append(Paragraph("환자 정보", heading_style))
+
+        patient_data = [
+            ['항목', '내용'],
+            ['이름', patient.get('name', '-')],
+            ['성별', patient.get('gender', '-')],
+            ['키', f"{patient.get('height_cm', '-')} cm"],
+            ['등록일', patient.get('created_at', '-')[:10] if patient.get('created_at') else '-']
+        ]
+
+        patient_table = Table(patient_data, colWidths=[80, 200])
+        patient_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#3498db')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, -1), 'MalgunGothic'),
+            ('FONTSIZE', (0, 0), (-1, -1), 11),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+            ('TOPPADDING', (0, 0), (-1, -1), 10),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#ecf0f1')),
+            ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#bdc3c7'))
+        ]))
+        elements.append(patient_table)
+        elements.append(Spacer(1, 20))
+
+        # 측정 기록
+        elements.append(Paragraph("측정 기록", heading_style))
+
+        measurement_data = [['측정일', '시간(초)', '속도(m/s)', '속도(km/h)', '평가']]
+        for m in measurements:
+            date_str = m['measured_at'][:10] if m.get('measured_at') else '-'
+            time_sec = m.get('time_seconds', 0)
+            speed_ms = m.get('speed_ms', 0)
+            speed_kmh = speed_ms * 3.6
+            grade = m.get('grade', '-')
+            measurement_data.append([
+                date_str,
+                f"{time_sec:.2f}",
+                f"{speed_ms:.2f}",
+                f"{speed_kmh:.2f}",
+                grade
+            ])
+
+        measurement_table = Table(measurement_data, colWidths=[80, 60, 70, 70, 60])
+        measurement_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#27ae60')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, -1), 'MalgunGothic'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+            ('TOPPADDING', (0, 0), (-1, -1), 8),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#f9f9f9')),
+            ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#bdc3c7')),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f5f5f5')])
+        ]))
+        elements.append(measurement_table)
+        elements.append(Spacer(1, 20))
+
+        # 통계 요약
+        if measurements:
+            elements.append(Paragraph("통계 요약", heading_style))
+
+            times = [m.get('time_seconds', 0) for m in measurements]
+            speeds = [m.get('speed_ms', 0) for m in measurements]
+
+            stats_data = [
+                ['항목', '최근', '평균', '최소', '최대'],
+                ['시간(초)', f"{times[0]:.2f}", f"{sum(times)/len(times):.2f}",
+                 f"{min(times):.2f}", f"{max(times):.2f}"],
+                ['속도(m/s)', f"{speeds[0]:.2f}", f"{sum(speeds)/len(speeds):.2f}",
+                 f"{min(speeds):.2f}", f"{max(speeds):.2f}"]
+            ]
+
+            stats_table = Table(stats_data, colWidths=[70, 60, 60, 60, 60])
+            stats_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#9b59b6')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, -1), 'MalgunGothic'),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+                ('TOPPADDING', (0, 0), (-1, -1), 8),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#f5f5f5')),
+                ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#bdc3c7'))
+            ]))
+            elements.append(stats_table)
+            elements.append(Spacer(1, 20))
+
+        # 트렌드 그래프 생성 및 추가
+        if len(measurements) > 1:
+            elements.append(Paragraph("변화 추이 그래프", heading_style))
+
+            # 그래프 이미지 생성
+            graph_image = self.create_trend_graph_image(measurements)
+            if graph_image:
+                elements.append(RLImage(graph_image, width=160*mm, height=80*mm))
+
+        # 평가 기준 안내
+        elements.append(Spacer(1, 30))
+        elements.append(Paragraph("평가 기준", heading_style))
+
+        criteria_data = [
+            ['평가', '시간 기준', '설명'],
+            ['정상', '10초 미만', '정상적인 보행 속도'],
+            ['약간느림', '10~20초', '약간 느린 보행 속도'],
+            ['느림', '20~30초', '느린 보행 속도, 주의 필요'],
+            ['매우느림', '30초 이상', '매우 느린 보행 속도, 관리 필요']
+        ]
+
+        criteria_table = Table(criteria_data, colWidths=[60, 80, 150])
+        criteria_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#34495e')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, -1), 'MalgunGothic'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('BACKGROUND', (0, 1), (0, 1), colors.HexColor('#2ecc71')),
+            ('BACKGROUND', (0, 2), (0, 2), colors.HexColor('#f1c40f')),
+            ('BACKGROUND', (0, 3), (0, 3), colors.HexColor('#e67e22')),
+            ('BACKGROUND', (0, 4), (0, 4), colors.HexColor('#e74c3c')),
+            ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#bdc3c7'))
+        ]))
+        elements.append(criteria_table)
+
+        # PDF 생성
+        doc.build(elements)
+
+    def create_trend_graph_image(self, measurements):
+        """트렌드 그래프 이미지 생성"""
+        try:
+            # 데이터 준비 (오래된 순으로 정렬)
+            measurements_sorted = sorted(measurements, key=lambda x: x.get('measured_at', ''))
+            dates = [m['measured_at'][:10] if m.get('measured_at') else '' for m in measurements_sorted]
+            times = [m.get('time_seconds', 0) for m in measurements_sorted]
+            speeds = [m.get('speed_ms', 0) for m in measurements_sorted]
+
+            # Figure 생성
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+            fig.patch.set_facecolor('white')
+
+            # 시간 그래프
+            ax1.plot(range(len(times)), times, 'o-', color='#3498db', linewidth=2, markersize=8)
+            ax1.fill_between(range(len(times)), times, alpha=0.3, color='#3498db')
+            ax1.set_xlabel('측정 회차', fontsize=10)
+            ax1.set_ylabel('시간 (초)', fontsize=10)
+            ax1.set_title('시간 변화 추이', fontsize=12, fontweight='bold')
+            ax1.grid(True, alpha=0.3)
+
+            # 속도 그래프
+            ax2.plot(range(len(speeds)), speeds, 's-', color='#e74c3c', linewidth=2, markersize=8)
+            ax2.fill_between(range(len(speeds)), speeds, alpha=0.3, color='#e74c3c')
+            ax2.set_xlabel('측정 회차', fontsize=10)
+            ax2.set_ylabel('속도 (m/s)', fontsize=10)
+            ax2.set_title('속도 변화 추이', fontsize=12, fontweight='bold')
+            ax2.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+
+            # 이미지로 저장
+            img_buffer = io.BytesIO()
+            plt.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            img_buffer.seek(0)
+
+            return img_buffer
+
+        except Exception as e:
+            print(f"그래프 생성 오류: {e}")
+            return None
 
     def run(self):
         self.root.mainloop()
