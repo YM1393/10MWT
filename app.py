@@ -1050,7 +1050,6 @@ class App:
             self.root.update()
             try:
                 from ultralytics import YOLO
-                # 더 정확한 모델 사용 (n < s < m < l < x)
                 model_path = os.path.join(BASE_DIR, 'yolov8m-pose.pt')
                 self.model = YOLO(model_path)
             except Exception as e:
