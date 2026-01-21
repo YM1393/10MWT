@@ -17,6 +17,13 @@ matplotlib.use('TkAgg')
 matplotlib.rcParams['font.family'] = 'Malgun Gothic'
 matplotlib.rcParams['axes.unicode_minus'] = False
 
+# 스크립트 기준 경로 설정
+import sys
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # PDF 생성
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
@@ -1044,7 +1051,8 @@ class App:
             try:
                 from ultralytics import YOLO
                 # 더 정확한 모델 사용 (n < s < m < l < x)
-                self.model = YOLO('yolov8m-pose.pt')
+                model_path = os.path.join(BASE_DIR, 'yolov8m-pose.pt')
+                self.model = YOLO(model_path)
             except Exception as e:
                 messagebox.showerror("에러", f"YOLO Pose 로드 실패\n{e}")
                 return
@@ -2089,10 +2097,14 @@ class App:
                 # 측정 ID 매핑 저장
                 self.measurement_id_map[item_id] = m['id']
 
-                # 발목 데이터 저장 (그래프용)
+                # 발목 데이터 저장 (그래프용 + CSV용)
                 if m.get('ankle_data'):
                     try:
                         ankle_data = json.loads(m['ankle_data'])
+                        # 환자 정보 추가
+                        ankle_data['name'] = patient['name']
+                        ankle_data['gender'] = patient.get('gender', '')
+                        ankle_data['height'] = patient.get('height_cm', '')
                         self.ankle_data_per_measurement[item_id] = ankle_data
                     except:
                         pass
@@ -2323,7 +2335,7 @@ class App:
 
         # 시간 그래프
         ax1.set_facecolor('#16213e')
-        ax1.plot(range(len(times)), times, 'o-', color='#4ecca3', linewidth=2, markersize=8)
+        ax1.plot(range(len(times)), times, '-', color='#4ecca3', linewidth=2)
         ax1.set_xlabel('측정 회차', color='white')
         ax1.set_ylabel('시간 (초)', color='white')
         ax1.set_title('시간 변화 추이', color='white', fontsize=12)
@@ -2334,7 +2346,7 @@ class App:
 
         # 속도 그래프
         ax2.set_facecolor('#16213e')
-        ax2.plot(range(len(speeds)), speeds, 's-', color='#e94560', linewidth=2, markersize=8)
+        ax2.plot(range(len(speeds)), speeds, '-', color='#e94560', linewidth=2)
         ax2.set_xlabel('측정 회차', color='white')
         ax2.set_ylabel('속도 (m/s)', color='white')
         ax2.set_title('속도 변화 추이', color='white', fontsize=12)
@@ -2596,7 +2608,7 @@ class App:
             fig.patch.set_facecolor('white')
 
             # 시간 그래프
-            ax1.plot(range(len(times)), times, 'o-', color='#3498db', linewidth=2, markersize=8)
+            ax1.plot(range(len(times)), times, '-', color='#3498db', linewidth=2)
             ax1.fill_between(range(len(times)), times, alpha=0.3, color='#3498db')
             ax1.set_xlabel('측정 회차', fontsize=10)
             ax1.set_ylabel('시간 (초)', fontsize=10)
@@ -2604,7 +2616,7 @@ class App:
             ax1.grid(True, alpha=0.3)
 
             # 속도 그래프
-            ax2.plot(range(len(speeds)), speeds, 's-', color='#e74c3c', linewidth=2, markersize=8)
+            ax2.plot(range(len(speeds)), speeds, '-', color='#e74c3c', linewidth=2)
             ax2.fill_between(range(len(speeds)), speeds, alpha=0.3, color='#e74c3c')
             ax2.set_xlabel('측정 회차', fontsize=10)
             ax2.set_ylabel('속도 (m/s)', fontsize=10)
